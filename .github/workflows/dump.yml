@@ -1,0 +1,110 @@
+name: Dump Oxide IL2CPP Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      binary_url:
+        description: "Direct or Google Drive link to the decrypted UnityFramework binary"
+        required: true
+      metadata_url:
+        description: "Direct or Google Drive link to global-metadata.dat"
+        required: true
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip jq
+          pip install --quiet gdown
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Fetch input files
+        run: |
+          mkdir -p input
+          fetch() {
+            url="$1"; out="$2"
+            if echo "$url" | grep -qi "drive.google.com"; then
+              gdown --fuzzy "$url" -O "$out"
+            else
+              curl -L --fail -o "$out" "$url"
+            fi
+          }
+          fetch "${{ github.event.inputs.binary_url }}" "input/UnityFramework"
+          fetch "${{ github.event.inputs.metadata_url }}" "input/global-metadata.dat"
+          ls -lh input
+          file input/UnityFramework
+          file input/global-metadata.dat
+
+      - name: Download latest Il2CppDumper
+        run: |
+          set +e
+          echo "== Querying GitHub API for latest release =="
+          http_code=$(curl -s -o api_response.json -w "%{http_code}" https://api.github.com/repos/Perfare/Il2CppDumper/releases/latest)
+          echo "HTTP status: $http_code"
+          cat api_response.json | head -c 1000
+          echo
+          url=""
+          if [ "$http_code" = "200" ]; then
+            url=$(jq -r '.assets[] | select(.name | test("linux-x64"; "i")) | .browser_download_url' api_response.json | head -n1)
+            if [ -z "$url" ] || [ "$url" = "null" ]; then
+              url=$(jq -r '.assets[] | select(.name | test("linux"; "i")) | .browser_download_url' api_response.json | head -n1)
+            fi
+            if [ -z "$url" ] || [ "$url" = "null" ]; then
+              echo "No linux asset matched, listing all asset names:"
+              jq -r '.assets[].name' api_response.json
+            fi
+          else
+            echo "API call failed, falling back to known tag v6.7.42"
+          fi
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            url="https://github.com/Perfare/Il2CppDumper/releases/download/v6.7.42/Il2CppDumper-v6.7.42-net6.0-linux-x64.zip"
+          fi
+          echo "Final URL: $url"
+          dl_code=$(curl -L -s -o il2cppdumper.zip -w "%{http_code}" "$url")
+          echo "Download HTTP status: $dl_code"
+          echo "== File type check =="
+          file il2cppdumper.zip
+          ls -lh il2cppdumper.zip
+          mkdir -p tool
+          if ! unzip -o il2cppdumper.zip -d tool; then
+            echo "== unzip failed, dumping first 500 bytes for diagnosis =="
+            head -c 500 il2cppdumper.zip
+            exit 2
+          fi
+          find tool -maxdepth 3 -type f
+          set -e
+
+      - name: Run Il2CppDumper
+        run: |
+          set +e
+          mkdir -p output
+          BIN=$(find tool -iname "Il2CppDumper" -type f | head -n1)
+          chmod +x "$BIN" 2>/dev/null
+          echo "Using binary: $BIN"
+          yes "" | timeout 180 "$BIN" input/UnityFramework input/global-metadata.dat output
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            DLL="${BIN}.dll"
+            if [ -f "$DLL" ]; then
+              echo "Direct exec failed (rc=$rc), retrying via dotnet"
+              yes "" | timeout 180 dotnet "$DLL" input/UnityFramework input/global-metadata.dat output
+            fi
+          fi
+          echo "---- output ----"
+          find output -maxdepth 2
+          set -e
+
+      - name: Upload dump result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxide-il2cpp-dump
+          path: output/**
+          if-no-files-found: warn
