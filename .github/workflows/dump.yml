@@ -1,0 +1,84 @@
+name: Dump Oxide IL2CPP Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      binary_url:
+        description: "Direct or Google Drive link to the decrypted UnityFramework binary"
+        required: true
+      metadata_url:
+        description: "Direct or Google Drive link to global-metadata.dat"
+        required: true
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip jq
+          pip install --quiet gdown
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Fetch input files
+        run: |
+          mkdir -p input
+          fetch() {
+            url="$1"; out="$2"
+            if echo "$url" | grep -qi "drive.google.com"; then
+              gdown --fuzzy "$url" -O "$out"
+            else
+              curl -L --fail -o "$out" "$url"
+            fi
+          }
+          fetch "${{ github.event.inputs.binary_url }}" "input/UnityFramework"
+          fetch "${{ github.event.inputs.metadata_url }}" "input/global-metadata.dat"
+          ls -lh input
+          file input/UnityFramework
+          file input/global-metadata.dat
+
+      - name: Download latest Il2CppDumper
+        run: |
+          api=$(curl -s https://api.github.com/repos/Perfare/Il2CppDumper/releases/latest)
+          url=$(echo "$api" | jq -r '.assets[] | select(.name | test("linux-x64"; "i")) | .browser_download_url' | head -n1)
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            url=$(echo "$api" | jq -r '.assets[] | select(.name | test("linux"; "i")) | .browser_download_url' | head -n1)
+          fi
+          echo "Picked asset: $url"
+          curl -L --fail -o il2cppdumper.zip "$url"
+          mkdir -p tool
+          unzip -o il2cppdumper.zip -d tool
+          find tool -maxdepth 3 -type f
+
+      - name: Run Il2CppDumper
+        run: |
+          set +e
+          mkdir -p output
+          BIN=$(find tool -iname "Il2CppDumper" -type f | head -n1)
+          chmod +x "$BIN" 2>/dev/null
+          echo "Using binary: $BIN"
+          yes "" | timeout 180 "$BIN" input/UnityFramework input/global-metadata.dat output
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            DLL="${BIN}.dll"
+            if [ -f "$DLL" ]; then
+              echo "Direct exec failed (rc=$rc), retrying via dotnet"
+              yes "" | timeout 180 dotnet "$DLL" input/UnityFramework input/global-metadata.dat output
+            fi
+          fi
+          echo "---- output ----"
+          find output -maxdepth 2
+          set -e
+
+      - name: Upload dump result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxide-il2cpp-dump
+          path: output/**
+          if-no-files-found: warn
